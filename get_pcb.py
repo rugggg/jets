@@ -7,6 +7,10 @@ import flax.linen as nn
 import optax
 from flax.training import train_state
 from jax import tree_util
+import jax.scipy as jsp
+from jax import lax
+
+
 
 
 def get_data(split="train"):
@@ -64,20 +68,64 @@ class full_conv_decoder(nn.Module):
 
         return x
 
+class InstanceSegmentationHead(nn.Module):
+
+    num_instances: int = 10
+    @nn.compact
+    def __call__(self, x):
+        # Instance Segmentation Head
+        instance_masks = nn.Conv(features=self.num_instances, kernel_size=(1, 1), name='instance_seg_head')(x)
+        instance_masks = nn.sigmoid(instance_masks) # [batch_size, height, width, num_instances]
+        return instance_masks
+
+def dice_loss(inputs, targets, smooth=1e-6):
+    """Dice loss for binary segmentation"""
+    inputs = inputs.reshape(-1)
+    targets = targets.reshape(-1)
+    intersection = jnp.sum(inputs * targets)
+    union = jnp.sum(inputs) + jnp.sum(targets)
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice
+
+def instance_segmentation_loss(pred_masks, true_masks, num_instances):
+    """Loss for instance segmentation head"""
+    batch_size, height, width, _ = pred_masks.shape
+    pred_masks = pred_masks.reshape(batch_size, height * width, num_instances)
+    true_masks = true_masks.reshape(batch_size, height * width, num_instances)
+
+    dice_losses = dice_loss(pred_masks, true_masks)
+    dice_loss_sum = jnp.sum(dice_losses, axis=2)  # Sum across instances
+    dice_loss_mean = jnp.mean(dice_loss_sum)  # Mean across batch and spatial dimensions
+
+    return dice_loss_mean
+
+
+def loss_fn(pred_instance_masks, targets):
+    # bboxes, pred_instance_masks, pred_masks = model(inputs)
+
+    # Compute losses
+    #bbox_loss = ...  # Your bounding box loss implementation
+    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 20) # 20 = num_instances
+    #mask_loss = ...  # Your segmentation mask loss implementation (optional)
+
+    total_loss = instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
+    return total_loss
+
 
 class InstanceSegmentationModel(nn.Module):
 
     def setup(self, latent_dim: int = 128):
         self.encoder = full_conv_encoder(latent_dim)
         self.decoder = full_conv_decoder(latent_dim)
-        self.out_layer = nn.Conv(features=1, kernel_size=(7, 7), strides=(2, 2), padding='SAME')
+        self.instance_seg_head = InstanceSegmentationHead()
+        # self.out_layer = nn.Conv(features=1, kernel_size=(7, 7), strides=(2, 2), padding='SAME')
 
 
     def __call__(self, x):
         z = self.encoder(x)
         x_hat = self.decoder(z)
         
-        x_out = self.out_layer(x_hat)
+        x_out = self.instance_seg_head(x_hat)
         return x_out
 
 
@@ -108,13 +156,13 @@ def calc_loss(state, params, batch):
     objects = batch['segementation']
     pred = state.apply_fn(params, img)
     print(batch['segmentation'])
-    return iou_loss(pred, objects)
+    return loss_fn(pred, objects)
 
 @jax.jit
 def train_step(state, batch):
     grad_fn = jax.value_and_grad(iou_loss, argnums=1)
     y_pred = state.apply_fn(state.params, batch['image'])
-    loss = iou_loss(y_pred, convert_to_segmentation_format(batch['objects']))
+    loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects']))
     grads = jax.grad(loss)(state.params)
     updates, params = state.optimizer.update(grads, state.params)
     return params
