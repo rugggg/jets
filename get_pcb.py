@@ -102,10 +102,11 @@ def instance_segmentation_loss(pred_masks, true_masks, num_instances):
 
 def loss_fn(pred_instance_masks, targets):
     # bboxes, pred_instance_masks, pred_masks = model(inputs)
-
+    print("targets...")
+    print(targets)
     # Compute losses
     #bbox_loss = ...  # Your bounding box loss implementation
-    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 20) # 20 = num_instances
+    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 10) # 20 = num_instances
     #mask_loss = ...  # Your segmentation mask loss implementation (optional)
 
     total_loss = instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
@@ -130,19 +131,19 @@ class InstanceSegmentationModel(nn.Module):
 
 
 def convert_to_segmentation_format(instance_dict):
-    # Extract relevant data from the dictionary
-    category_id = instance_dict["category"][0]
-    bbox = jnp.asarray(instance_dict["bbox"][0])
-    segmentation = jnp.asarray(instance_dict["segmentation"][0])
+    all_data = []
 
-    # Create a PyTree structure for the output
-    output = {
-        "category_id": category_id,
-        "bbox": bbox,
-        "segmentation": segmentation,
-    }
+    for idx, seg in enumerate(instance_dict["segmentation"]):
+        
+        category = instance_dict["category"][idx]
+        segmentation = jnp.array(instance_dict["segmentation"][idx][0]).flatten()
 
-    return tree_util.tree_flatten(output)[0]
+        instance_data = [category]
+        instance_data.extend(segmentation)
+        all_data.append(instance_data)
+
+    all_data = jnp.array(all_data)
+    return all_data
 
 def iou_loss(y_pred, y_true):
     print(y_true)
@@ -151,12 +152,6 @@ def iou_loss(y_pred, y_true):
     iou = intersection / union
     return 1 - iou
 
-def calc_loss(state, params, batch):
-    img = batch['image']
-    objects = batch['segementation']
-    pred = state.apply_fn(params, img)
-    print(batch['segmentation'])
-    return loss_fn(pred, objects)
 
 @jax.jit
 def train_step(state, batch):
