@@ -1,4 +1,6 @@
 import io
+
+from seaborn.utils import axis_ticklabels_overlap
 from datasets import load_dataset
 import jax
 import jax.numpy as jnp
@@ -55,8 +57,12 @@ class full_conv_decoder(nn.Module):
         x = nn.Dense(features=self.latent_dim)(x)
         x = nn.relu(x)
 
-        x = x.reshape(x.shape[0], 4, 4, -1)
- 
+        x = x.reshape(x.shape[0], -1,8)
+  
+        x = nn.ConvTranspose(features=8, kernel_size=(3,3), strides=(2,2))(x)
+        x = nn.relu(x)
+
+
         x = nn.ConvTranspose(features=16, kernel_size=(3,3), strides=(2,2))(x)
         x = nn.relu(x)
 
@@ -70,43 +76,72 @@ class full_conv_decoder(nn.Module):
 
 class InstanceSegmentationHead(nn.Module):
 
-    num_instances: int = 10
+    num_instances: int = 7
+    num_classes: int = 11
+
     @nn.compact
     def __call__(self, x):
         # Instance Segmentation Head
         instance_masks = nn.Conv(features=self.num_instances, kernel_size=(1, 1), name='instance_seg_head')(x)
         instance_masks = nn.sigmoid(instance_masks) # [batch_size, height, width, num_instances]
-        return instance_masks
+        class_logits = nn.Conv(self.num_instances * self.num_classes, kernel_size=(1, 1))(x)
+        class_logits = class_logits.reshape(-1, self.num_instances, self.num_classes) # [batch_size, num_instances, num_classes]
+        confidences = nn.Conv(features=self.num_instances, kernel_size=(1, 1), name='instance_confidences')(x)
+        confidences = nn.sigmoid(confidences.mean(axis=(1,2))) # (batch_size, num_classes)
+        return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
-def dice_loss(inputs, targets, smooth=1e-6):
-    """Dice loss for binary segmentation"""
-    inputs = inputs.reshape(-1)
-    targets = targets.reshape(-1)
-    intersection = jnp.sum(inputs * targets)
-    union = jnp.sum(inputs) + jnp.sum(targets)
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    return 1.0 - dice
 
-def instance_segmentation_loss(pred_masks, true_masks, num_instances):
-    """Loss for instance segmentation head"""
-    batch_size, height, width, _ = pred_masks.shape
-    pred_masks = pred_masks.reshape(batch_size, height * width, num_instances)
-    true_masks = true_masks.reshape(batch_size, height * width, num_instances)
+def instance_segmentation_loss(predictions, targets, num_classes):
+    masks_pred = predictions['masks']
+    class_logits = predictions['class_logits']
+    confidences = predictions['confidences']
 
-    dice_losses = dice_loss(pred_masks, true_masks)
-    dice_loss_sum = jnp.sum(dice_losses, axis=2)  # Sum across instances
-    dice_loss_mean = jnp.mean(dice_loss_sum)  # Mean across batch and spatial dimensions
-
-    return dice_loss_mean
+    masks_true = targets['masks']
+    classes_true = targets['classes']
+    
+    batch_size, height, width, num_instances = masks_pred.shape
+    
+    def single_image_loss(masks_pred, class_logits, confidences, masks_true, classes_true):
+        # Compute pairwise IoU between predicted and true masks
+        intersection = jnp.sum(masks_pred[:, None] * masks_true[None, :], axis=(1, 2))
+        union = jnp.sum(masks_pred[:, None] + masks_true[None, :], axis=(1, 2)) - intersection
+        iou = intersection / (union + 1e-6)
+        
+        # Use negative IoU as cost for Hungarian matching
+        cost_matrix = -iou
+        
+        # Perform Hungarian matching
+        indices = jax.scipy.optimize.linear_sum_assignment(cost_matrix)
+        indices = jnp.array(indices).T
+        
+        # Compute mask loss (Dice loss)
+        matched_ious = iou[indices[:, 0], indices[:, 1]]
+        mask_loss = 1 - (2 * matched_ious / (matched_ious + 1))
+        
+        # Compute classification loss
+        matched_logits = class_logits[indices[:, 0]]
+        matched_classes = classes_true[indices[:, 1]]
+        class_loss = jax.nn.softmax_cross_entropy(matched_logits, jax.nn.one_hot(matched_classes, num_classes))
+        
+        # Compute confidence loss (binary cross-entropy)
+        conf_true = jnp.zeros_like(confidences)
+        conf_true = conf_true.at[indices[:, 0]].set(1)
+        conf_loss = jnp.mean(-(conf_true * jnp.log(confidences + 1e-6) + (1 - conf_true) * jnp.log(1 - confidences + 1e-6)))
+        
+        return jnp.mean(mask_loss) + jnp.mean(class_loss) + conf_loss
+    
+    # Vectorize the single image loss function over the batch
+    batch_loss = jax.vmap(single_image_loss)
+    print(masks_pred.shape, class_logits.shape, confidences.shape, masks_true.shape, classes_true.shape) 
+    total_loss = batch_loss(masks_pred, class_logits, confidences, masks_true, classes_true)
+    return jnp.mean(total_loss)
 
 
 def loss_fn(pred_instance_masks, targets):
     # bboxes, pred_instance_masks, pred_masks = model(inputs)
-    print("targets...")
-    print(targets)
     # Compute losses
     #bbox_loss = ...  # Your bounding box loss implementation
-    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 10) # 20 = num_instances
+    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 7) # 20 = num_instances
     #mask_loss = ...  # Your segmentation mask loss implementation (optional)
 
     total_loss = instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
@@ -114,11 +149,14 @@ def loss_fn(pred_instance_masks, targets):
 
 
 class InstanceSegmentationModel(nn.Module):
+    
+    num_instances: int = 3
+    num_classes: int = 4
 
     def setup(self, latent_dim: int = 128):
         self.encoder = full_conv_encoder(latent_dim)
         self.decoder = full_conv_decoder(latent_dim)
-        self.instance_seg_head = InstanceSegmentationHead()
+        self.instance_seg_head = InstanceSegmentationHead(num_instances=self.num_instances, num_classes=self.num_classes)
         # self.out_layer = nn.Conv(features=1, kernel_size=(7, 7), strides=(2, 2), padding='SAME')
 
 
@@ -130,23 +168,17 @@ class InstanceSegmentationModel(nn.Module):
         return x_out
 
 
-def convert_to_segmentation_format(instance_dict):
-    all_data = []
-
+def convert_to_segmentation_format(instance_dict, mask_shape):
+    classes = jnp.zeros(mask_shape[-1])
+    mask = jnp.zeros(mask_shape)
     for idx, seg in enumerate(instance_dict["segmentation"]):
-        
         category = instance_dict["category"][idx]
-        segmentation = jnp.array(instance_dict["segmentation"][idx][0]).flatten()
-
-        instance_data = [category]
-        instance_data.extend(segmentation)
-        all_data.append(instance_data)
-
-    all_data = jnp.array(all_data)
-    return all_data
+        mask.at[0:100, 0:100, idx].set(1)
+        classes.at[idx].set(category)
+        # segmentation = jnp.array(instance_dict["segmentation"][idx][0]).flatten()
+    return {"masks": mask, "classes": classes}
 
 def iou_loss(y_pred, y_true):
-    print(y_true)
     intersection = jnp.sum(y_pred * y_true, axis=(1, 2))
     union = jnp.sum(y_pred + y_true, axis=(1, 2))
     iou = intersection / union
@@ -157,7 +189,7 @@ def iou_loss(y_pred, y_true):
 def train_step(state, batch):
     grad_fn = jax.value_and_grad(iou_loss, argnums=1)
     y_pred = state.apply_fn(state.params, batch['image'])
-    loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects']))
+    loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects'], y_pred['masks'].shape))
     grads = jax.grad(loss)(state.params)
     updates, params = state.optimizer.update(grads, state.params)
     return params
@@ -166,7 +198,6 @@ def train_loop(model_state, dataset, epochs=100):
 
     for epoch in range(100):
         for batch in dataset:
-            print(batch['objects'])
             model_state.params = train_step(model_state, batch)   
     return model_state
 
@@ -182,7 +213,7 @@ if __name__ == "__main__":
     rng, inp_rng, init_rng = jax.random.split(rng, 3)
     # Initialize the model
     params = model.init(init_rng, exp_img)
-
+    print(model.tabulate(jax.random.key(0), exp_img))
     optimizer = optax.adam(learning_rate=1e-4)
     #  
     model_state = train_state.TrainState.create(apply_fn=model.apply,
