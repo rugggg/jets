@@ -185,17 +185,20 @@ def iou_loss(y_pred, y_true):
 @jax.jit
 def train_step(state, batch):
     grad_fn = jax.value_and_grad(iou_loss, argnums=1)
-    print(batch['image'])
-    y_pred = state.apply_fn(state.params, batch['image'])
+    y_pred = state.apply_fn(state.params, jnp.expand_dims(batch['image'], 0)) # expand dims is hack for batch size 1
     loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects'], y_pred['masks'].shape))
     grads = jax.grad(loss)(state.params)
     updates, params = state.optimizer.update(grads, state.params)
     return params
 
+
+
 def train_loop(model_state, dataset, epochs=100):
 
     for epoch in range(100):
         for batch in dataset:
+            print("************")
+            print(batch['image'].shape)
             model_state.params = train_step(model_state, batch)   
     return model_state
 
