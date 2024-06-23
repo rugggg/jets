@@ -51,22 +51,19 @@ class full_conv_encoder(nn.Module):
 class full_conv_decoder(nn.Module):
 
     latent_dim: int = 128
+    initial_shape: tuple[int, int] = (480, 640)
+    num_encoder_layers: int = 3
+
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(features=self.latent_dim)(x)
-        x = nn.relu(x)
-
-        x = x.reshape(x.shape[0], -1,8)
-  
-        x = nn.ConvTranspose(features=8, kernel_size=(3,3), strides=(2,2))(x)
-        x = nn.relu(x)
-
-
+        x = nn.Dense(features=(self.initial_shape[0]//(2**self.num_encoder_layers))*(self.initial_shape[1]//(2**self.num_encoder_layers))*32)(x)
+        x = x.reshape(-1, self.initial_shape[0]//(2**self.num_encoder_layers), self.initial_shape[1]//(2**self.num_encoder_layers), 32)
+ 
         x = nn.ConvTranspose(features=16, kernel_size=(3,3), strides=(2,2))(x)
         x = nn.relu(x)
 
-        x = nn.ConvTranspose(features=32, kernel_size=(3,3), strides=(2,2))(x)
+        x = nn.ConvTranspose(features=8, kernel_size=(3,3), strides=(2,2))(x)
         x = nn.relu(x)
 
         x = nn.ConvTranspose(features=3, kernel_size=(3,3), strides=(2,2))(x)
@@ -188,6 +185,7 @@ def iou_loss(y_pred, y_true):
 @jax.jit
 def train_step(state, batch):
     grad_fn = jax.value_and_grad(iou_loss, argnums=1)
+    print(batch['image'])
     y_pred = state.apply_fn(state.params, batch['image'])
     loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects'], y_pred['masks'].shape))
     grads = jax.grad(loss)(state.params)
@@ -206,14 +204,15 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(42)
 
     train_dataset = get_data("train")
-    exp_img = train_dataset[0]["image"]
+    # expand the sample image so it looks like batch of 1
+    exp_img = jnp.expand_dims(train_dataset[0]["image"], 0)
     model = InstanceSegmentationModel()
     # init model
     # parameter init
     rng, inp_rng, init_rng = jax.random.split(rng, 3)
+    print(model.tabulate(jax.random.key(0), exp_img))
     # Initialize the model
     params = model.init(init_rng, exp_img)
-    print(model.tabulate(jax.random.key(0), exp_img))
     optimizer = optax.adam(learning_rate=1e-4)
     #  
     model_state = train_state.TrainState.create(apply_fn=model.apply,
