@@ -13,8 +13,6 @@ import jax.scipy as jsp
 from jax import lax
 
 
-
-
 def get_data(split="train"):
     ds = load_dataset("keremberke/pcb-defect-segmentation", name="full")
 
@@ -88,13 +86,50 @@ class InstanceSegmentationHead(nn.Module):
         return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
 
+@jax.jit
+def hungarian_algorithm(cost_matrix):
+    n, m = cost_matrix.shape
+    
+    # Step 1: Subtract row minima
+    cost_matrix = cost_matrix - jnp.min(cost_matrix, axis=1, keepdims=True)
+    
+    # Step 2: Subtract column minima
+    cost_matrix = cost_matrix - jnp.min(cost_matrix, axis=0, keepdims=True)
+    
+    # Step 3: Find a zero in each row
+    row_ind = jnp.argmin(cost_matrix, axis=1)
+    col_ind = jnp.arange(n)
+    
+    # Step 4: Create a mask for assignments
+    mask = jnp.zeros_like(cost_matrix, dtype=bool)
+    mask = mask.at[col_ind, row_ind].set(True)
+    
+    # Step 5: Greedy assignment for unassigned columns
+    def assign_remaining(carry, x):
+        mask, col_ind, row_ind = carry
+        unassigned_rows = ~jnp.any(mask, axis=1)
+        row = jnp.argmax(unassigned_rows)
+        mask = mask.at[row, x].set(True)
+        col_ind = col_ind.at[row].set(x)
+        row_ind = row_ind.at[x].set(row)
+        return (mask, col_ind, row_ind), None
+
+    (mask, col_ind, row_ind), _ = jax.lax.scan(
+        assign_remaining,
+        (mask, col_ind, row_ind),
+        jnp.arange(n)
+    )
+    
+    return jnp.column_stack((col_ind, row_ind))
+
+
 def instance_segmentation_loss(predictions, targets, num_classes):
     masks_pred = predictions['masks']
-    class_logits = predictions['class_logits']
+    class_logits = jnp.expand_dims(predictions['class_logits'], 0)
     confidences = predictions['confidences']
 
     masks_true = targets['masks']
-    classes_true = targets['classes']
+    classes_true = jnp.expand_dims(targets['classes'], 0)
     
     batch_size, height, width, num_instances = masks_pred.shape
     
@@ -107,10 +142,7 @@ def instance_segmentation_loss(predictions, targets, num_classes):
         # Use negative IoU as cost for Hungarian matching
         cost_matrix = -iou
         
-        # Perform Hungarian matching
-        indices = jax.scipy.optimize.linear_sum_assignment(cost_matrix)
-        indices = jnp.array(indices).T
-        
+        indices = hungarian_algorithm(cost_matrix)
         # Compute mask loss (Dice loss)
         matched_ious = iou[indices[:, 0], indices[:, 1]]
         mask_loss = 1 - (2 * matched_ious / (matched_ious + 1))
@@ -118,7 +150,7 @@ def instance_segmentation_loss(predictions, targets, num_classes):
         # Compute classification loss
         matched_logits = class_logits[indices[:, 0]]
         matched_classes = classes_true[indices[:, 1]]
-        class_loss = jax.nn.softmax_cross_entropy(matched_logits, jax.nn.one_hot(matched_classes, num_classes))
+        class_loss = optax.softmax_cross_entropy(matched_logits, jax.nn.one_hot(matched_classes, num_classes))
         
         # Compute confidence loss (binary cross-entropy)
         conf_true = jnp.zeros_like(confidences)
