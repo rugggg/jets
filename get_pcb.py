@@ -1,6 +1,5 @@
 import io
-
-from seaborn.utils import axis_ticklabels_overlap
+import numpy as np
 from datasets import load_dataset
 import jax
 import jax.numpy as jnp
@@ -126,14 +125,17 @@ def hungarian_algorithm(cost_matrix):
 def instance_segmentation_loss(predictions, targets, num_classes):
     masks_pred = predictions['masks']
     class_logits = jnp.expand_dims(predictions['class_logits'], 0)
-    confidences = predictions['confidences']
+    confidences = jnp.expand_dims(predictions['confidences'], 0)
 
     masks_true = targets['masks']
     classes_true = jnp.expand_dims(targets['classes'], 0)
-    
+    print(masks_pred.shape) 
     batch_size, height, width, num_instances = masks_pred.shape
     
     def single_image_loss(masks_pred, class_logits, confidences, masks_true, classes_true):
+        print(masks_pred.shape)
+        masks_pred = jnp.squeeze(masks_pred)
+        masks_true = jnp.squeeze(masks_true)
         # Compute pairwise IoU between predicted and true masks
         intersection = jnp.sum(masks_pred[:, None] * masks_true[None, :], axis=(1, 2))
         union = jnp.sum(masks_pred[:, None] + masks_true[None, :], axis=(1, 2)) - intersection
@@ -143,6 +145,7 @@ def instance_segmentation_loss(predictions, targets, num_classes):
         cost_matrix = -iou
         
         indices = hungarian_algorithm(cost_matrix)
+        print("indices shape", indices.shape)
         # Compute mask loss (Dice loss)
         matched_ious = iou[indices[:, 0], indices[:, 1]]
         mask_loss = 1 - (2 * matched_ious / (matched_ious + 1))
@@ -150,6 +153,7 @@ def instance_segmentation_loss(predictions, targets, num_classes):
         # Compute classification loss
         matched_logits = class_logits[indices[:, 0]]
         matched_classes = classes_true[indices[:, 1]]
+        print(matched_logits.shape, matched_classes.shape)
         class_loss = optax.softmax_cross_entropy(matched_logits, jax.nn.one_hot(matched_classes, num_classes))
         
         # Compute confidence loss (binary cross-entropy)
@@ -161,7 +165,7 @@ def instance_segmentation_loss(predictions, targets, num_classes):
     
     # Vectorize the single image loss function over the batch
     batch_loss = jax.vmap(single_image_loss)
-    print(masks_pred.shape, class_logits.shape, confidences.shape, masks_true.shape, classes_true.shape) 
+    print("Mask Pred Shape:", masks_pred.shape, "class logits.shape:", class_logits.shape, "confidences.shape:", confidences.shape, "true masks shape", masks_true.shape, "true classes.shape:", classes_true.shape) 
     total_loss = batch_loss(masks_pred, class_logits, confidences, masks_true, classes_true)
     return jnp.mean(total_loss)
 
@@ -170,7 +174,7 @@ def loss_fn(pred_instance_masks, targets):
     # bboxes, pred_instance_masks, pred_masks = model(inputs)
     # Compute losses
     #bbox_loss = ...  # Your bounding box loss implementation
-    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, 7) # 20 = num_instances
+    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, num_classes=3) # 20 = num_classes?
     #mask_loss = ...  # Your segmentation mask loss implementation (optional)
 
     total_loss = instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
@@ -197,14 +201,16 @@ class InstanceSegmentationModel(nn.Module):
         return x_out
 
 
+
 def convert_to_segmentation_format(instance_dict, mask_shape):
     classes = jnp.zeros(mask_shape[-1])
-    mask = jnp.zeros(mask_shape)
+    mask = jnp.zeros((1,480, 640, 3, 4))
     for idx, seg in enumerate(instance_dict["segmentation"]):
         category = instance_dict["category"][idx]
         mask.at[0:100, 0:100, idx].set(1)
         classes.at[idx].set(category)
         # segmentation = jnp.array(instance_dict["segmentation"][idx][0]).flatten()
+    print("SEFSDFDSF", mask.shape)
     return {"masks": mask, "classes": classes}
 
 def iou_loss(y_pred, y_true):
@@ -240,6 +246,7 @@ if __name__ == "__main__":
 
     train_dataset = get_data("train")
     # expand the sample image so it looks like batch of 1
+    print(train_dataset[0]['objects'])
     exp_img = jnp.expand_dims(train_dataset[0]["image"], 0)
     model = InstanceSegmentationModel()
     # init model
