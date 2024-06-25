@@ -84,7 +84,7 @@ class SemanticSegmentationHead(nn.Module):
 class InstanceSegmentationHead(nn.Module):
 
     num_instances: int = 7
-    num_classes: int = 11
+    num_classes: int = 5
 
     @nn.compact
     def __call__(self, x):
@@ -104,7 +104,7 @@ def create_segmentation_mask(data, image_shape=(480, 640)):
         y, x = jnp.mgrid[:shape[0], :shape[1]]
         x, y = x.reshape(-1), y.reshape(-1)
         
-        polygon = jnp.array(polygon)
+        polygon = jnp.reshape(polygon, (-1, 2))  # Ensure 2D array
         n = polygon.shape[0]
         
         def body_fun(i, inside):
@@ -119,17 +119,39 @@ def create_segmentation_mask(data, image_shape=(480, 640)):
         inside = jax.lax.fori_loop(0, n, body_fun, jnp.zeros(x.shape[0], dtype=bool))
         return inside.reshape(shape)
 
-    def process_single_instance(carry, instance_data):
-        mask, category, segmentation = instance_data
-        instance_mask = polygon_to_mask(segmentation[0], image_shape)
-        return jnp.where(instance_mask, category, mask), None
+    def process_single_instance(mask, category, segmentation):
+        # Handle potential empty segmentation
+        def create_instance_mask(seg):
+            return jax.lax.cond(
+                seg.size > 0,
+                lambda s: polygon_to_mask(s, image_shape),
+                lambda _: jnp.zeros(image_shape, dtype=bool),
+                seg
+            )
+        
+        instance_mask = create_instance_mask(jnp.array(segmentation))
+        return jnp.where(instance_mask, category, mask)
 
     initial_mask = jnp.zeros(image_shape, dtype=jnp.int32)
-    instances = list(zip(data['category'], data['segmentation']))
     
-    final_mask, _ = jax.lax.scan(process_single_instance, initial_mask, instances)
+    # Handle empty input
+    num_instances = jnp.shape(data['category'])[0]
     
+    def body_fun(carry, x):
+        mask, i = carry
+        return (
+            jax.lax.cond(
+                i < num_instances,
+                lambda args: process_single_instance(args[0], args[1], args[2]),
+                lambda args: args[0],
+                (mask, data['category'][i], data['segmentation'][i])
+            ),
+            i + 1
+        ), None
+
+    final_mask, _ = jax.lax.scan(body_fun, (initial_mask, 0), None, length=num_instances)
     return final_mask
+
 
 @jax.jit
 def hungarian_algorithm(cost_matrix):
@@ -187,7 +209,7 @@ def segmentation_loss(predictions, targets, class_weights=None, epsilon=1e-7):
     predictions = jax.nn.softmax(predictions, axis=-1)
     targets = jnp.zeros((480, 640)) 
     # Convert targets to one-hot encoding
-    targets_one_hot = jax.nn.one_hot(targets, 4)
+    targets_one_hot = jax.nn.one_hot(targets, 5)
     
     # Compute cross-entropy loss
     cross_entropy = -jnp.sum(targets_one_hot * jnp.log(predictions + epsilon), axis=-1)
@@ -261,7 +283,7 @@ def loss_fn(pred_instance_masks, targets):
 class InstanceSegmentationModel(nn.Module):
     
     num_instances: int = 3
-    num_classes: int = 4
+    num_classes: int = 5
 
     def setup(self, latent_dim: int = 128):
         self.encoder = full_conv_encoder(latent_dim)
@@ -303,7 +325,7 @@ def train_step(state, batch):
     def loss_fn(params):
         batch_im = jnp.expand_dims(batch['image'], 0)
         predictions = state.apply_fn(params, batch_im)
-        loss = segmentation_loss(predictions, batch['objects']['segmentation'])
+        loss = segmentation_loss(predictions, create_segmentation_mask(batch['objects']))
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
