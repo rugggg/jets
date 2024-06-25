@@ -10,6 +10,7 @@ from flax.training import train_state
 from jax import tree_util
 import jax.scipy as jsp
 from jax import lax
+from tqdm import tqdm
 
 
 def get_data(split="train"):
@@ -68,6 +69,18 @@ class full_conv_decoder(nn.Module):
 
         return x
 
+
+class SemanticSegmentationHead(nn.Module):
+
+    num_classes: int = 3
+
+    @nn.compact
+    def __call__(self, x):
+        # Instance Segmentation Head
+        class_masks = nn.Conv(features=self.num_classes, kernel_size=(1, 1), name='instance_seg_head')(x)
+        return class_masks
+
+
 class InstanceSegmentationHead(nn.Module):
 
     num_instances: int = 7
@@ -84,6 +97,39 @@ class InstanceSegmentationHead(nn.Module):
         confidences = nn.sigmoid(confidences.mean(axis=(1,2))) # (batch_size, num_classes)
         return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
+
+@jax.jit
+def create_segmentation_mask(data, image_shape=(480, 640)):
+    def polygon_to_mask(polygon, shape):
+        y, x = jnp.mgrid[:shape[0], :shape[1]]
+        x, y = x.reshape(-1), y.reshape(-1)
+        
+        polygon = jnp.array(polygon)
+        n = polygon.shape[0]
+        
+        def body_fun(i, inside):
+            j = (i + 1) % n
+            p1x, p1y = polygon[i]
+            p2x, p2y = polygon[j]
+            
+            mask = ((p1y > y) != (p2y > y)) & \
+                   (x < (p2x - p1x) * (y - p1y) / (p2y - p1y + 1e-8) + p1x)
+            return inside ^ mask
+        
+        inside = jax.lax.fori_loop(0, n, body_fun, jnp.zeros(x.shape[0], dtype=bool))
+        return inside.reshape(shape)
+
+    def process_single_instance(carry, instance_data):
+        mask, category, segmentation = instance_data
+        instance_mask = polygon_to_mask(segmentation[0], image_shape)
+        return jnp.where(instance_mask, category, mask), None
+
+    initial_mask = jnp.zeros(image_shape, dtype=jnp.int32)
+    instances = list(zip(data['category'], data['segmentation']))
+    
+    final_mask, _ = jax.lax.scan(process_single_instance, initial_mask, instances)
+    
+    return final_mask
 
 @jax.jit
 def hungarian_algorithm(cost_matrix):
@@ -121,6 +167,40 @@ def hungarian_algorithm(cost_matrix):
     
     return jnp.column_stack((col_ind, row_ind))
 
+
+def segmentation_loss(predictions, targets, class_weights=None, epsilon=1e-7):
+    """
+    Compute pixel-wise segmentation loss for 3 classes.
+    
+    Args:
+    predictions: JAX array of shape (batch_size, height, width, 3)
+                 containing class probabilities for each pixel.
+    targets: JAX array of shape (batch_size, height, width) containing 
+             integer class labels (0, 1, or 2).
+    class_weights: Optional JAX array of shape (3,) for class weighting.
+    epsilon: Small constant to avoid log(0).
+    
+    Returns:
+    Scalar loss value.
+    """
+    # Ensure predictions are probabilities
+    predictions = jax.nn.softmax(predictions, axis=-1)
+    targets = jnp.zeros((480, 640)) 
+    # Convert targets to one-hot encoding
+    targets_one_hot = jax.nn.one_hot(targets, 4)
+    
+    # Compute cross-entropy loss
+    cross_entropy = -jnp.sum(targets_one_hot * jnp.log(predictions + epsilon), axis=-1)
+    
+    # Apply class weights if provided
+    if class_weights is not None:
+        weights = jnp.take(class_weights, targets)
+        cross_entropy *= weights
+    
+    # Compute mean loss
+    loss = jnp.mean(cross_entropy)
+    
+    return loss
 
 def instance_segmentation_loss(predictions, targets, num_classes):
     masks_pred = predictions['masks']
@@ -171,13 +251,10 @@ def instance_segmentation_loss(predictions, targets, num_classes):
 
 
 def loss_fn(pred_instance_masks, targets):
-    # bboxes, pred_instance_masks, pred_masks = model(inputs)
-    # Compute losses
-    #bbox_loss = ...  # Your bounding box loss implementation
-    instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, num_classes=3) # 20 = num_classes?
-    #mask_loss = ...  # Your segmentation mask loss implementation (optional)
-
-    total_loss = instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
+    # instance_seg_loss = instance_segmentation_loss(pred_instance_masks, targets, num_classes=3) # 20 = num_classes?
+    print(pred_instance_masks)
+    sem_seg_loss = segmentation_loss(pred_instance_masks['masks'], targets, class_weights=None, epsilon=1e-7)
+    total_loss = sem_seg_loss #instance_seg_loss # bbox_loss + instance_seg_loss + mask_loss
     return total_loss
 
 
@@ -189,7 +266,9 @@ class InstanceSegmentationModel(nn.Module):
     def setup(self, latent_dim: int = 128):
         self.encoder = full_conv_encoder(latent_dim)
         self.decoder = full_conv_decoder(latent_dim)
-        self.instance_seg_head = InstanceSegmentationHead(num_instances=self.num_instances, num_classes=self.num_classes)
+
+        self.semantic_seg_head = SemanticSegmentationHead(self.num_classes)
+        #self.instance_seg_head = InstanceSegmentationHead(num_instances=self.num_instances, num_classes=self.num_classes)
         # self.out_layer = nn.Conv(features=1, kernel_size=(7, 7), strides=(2, 2), padding='SAME')
 
 
@@ -197,7 +276,8 @@ class InstanceSegmentationModel(nn.Module):
         z = self.encoder(x)
         x_hat = self.decoder(z)
         
-        x_out = self.instance_seg_head(x_hat)
+        #x_out = self.instance_seg_head(x_hat)
+        x_out = self.semantic_seg_head(x_hat)
         return x_out
 
 
@@ -209,8 +289,6 @@ def convert_to_segmentation_format(instance_dict, mask_shape):
         category = instance_dict["category"][idx]
         mask.at[0:100, 0:100, idx].set(1)
         classes.at[idx].set(category)
-        # segmentation = jnp.array(instance_dict["segmentation"][idx][0]).flatten()
-    print("SEFSDFDSF", mask.shape)
     return {"masks": mask, "classes": classes}
 
 def iou_loss(y_pred, y_true):
@@ -222,23 +300,34 @@ def iou_loss(y_pred, y_true):
 
 @jax.jit
 def train_step(state, batch):
-    grad_fn = jax.value_and_grad(iou_loss, argnums=1)
-    y_pred = state.apply_fn(state.params, jnp.expand_dims(batch['image'], 0)) # expand dims is hack for batch size 1
-    loss = loss_fn(y_pred, convert_to_segmentation_format(batch['objects'], y_pred['masks'].shape))
-    grads = jax.grad(loss)(state.params)
-    updates, params = state.optimizer.update(grads, state.params)
-    return params
+    def loss_fn(params):
+        batch_im = jnp.expand_dims(batch['image'], 0)
+        predictions = state.apply_fn(params, batch_im)
+        loss = segmentation_loss(predictions, batch['objects']['segmentation'])
+        return loss
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    
+    # Update params using grads
+    # This is a placeholder; replace with your actual update logic
+    new_params = jax.tree.map(lambda p, g: p - 0.01 * g, state.params, grads)
+    
+    return state.replace(params=new_params), loss
 
 
+def train_loop(initial_state, train_dataset, epochs=3):
+    state = initial_state
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        num_batches = 0
+        for batch in tqdm(train_dataset):
+            state, loss = train_step(state, batch)
+            epoch_loss += loss
+            num_batches += 1
+        avg_loss = epoch_loss / num_batches
+        print(f"Epoch {epoch + 1}, Average Loss: {avg_loss}")
+    return state
 
-def train_loop(model_state, dataset, epochs=100):
-
-    for epoch in range(100):
-        for batch in dataset:
-            print("************")
-            print(batch['image'].shape)
-            model_state.params = train_step(model_state, batch)   
-    return model_state
 
 if __name__ == "__main__":
 
