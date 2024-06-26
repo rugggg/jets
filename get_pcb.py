@@ -98,8 +98,12 @@ class InstanceSegmentationHead(nn.Module):
         return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
 
+
 @jax.jit
 def create_segmentation_mask(data, image_shape=(480, 640)):
+    print("-----processing----")
+    print(data)
+    print("--------")
     def polygon_to_mask(polygon, shape):
         y, x = jnp.mgrid[:shape[0], :shape[1]]
         x, y = x.reshape(-1), y.reshape(-1)
@@ -119,8 +123,13 @@ def create_segmentation_mask(data, image_shape=(480, 640)):
         inside = jax.lax.fori_loop(0, n, body_fun, jnp.zeros(x.shape[0], dtype=bool))
         return inside.reshape(shape)
 
-    def process_single_instance(mask, category, segmentation):
+    def process_single_instance(idx, mask, category, segmentation):
         # Handle potential empty segmentation
+        category = category[idx]
+        print("SDFSDF", segmentation)
+        print("IDX", idx)
+        if jnp.ndim(segmentation) > 2:
+            segmentation = segmentation[idx]
         def create_instance_mask(seg):
             return jax.lax.cond(
                 seg.size > 0,
@@ -136,15 +145,19 @@ def create_segmentation_mask(data, image_shape=(480, 640)):
     
     # Handle empty input
     num_instances = jnp.shape(data['category'])[0]
-    
+    print(num_instances) 
+    if num_instances < 1:
+        print("---0 labels, return zeroes")
+        return initial_mask
     def body_fun(carry, x):
         mask, i = carry
+        print("idx", i)
         return (
             jax.lax.cond(
                 i < num_instances,
-                lambda args: process_single_instance(args[0], args[1], args[2]),
+                lambda args: process_single_instance(i, args[0], args[1], args[2]),
                 lambda args: args[0],
-                (mask, data['category'][i], data['segmentation'][i])
+                (mask, data['category'], data['segmentation'])
             ),
             i + 1
         ), None
