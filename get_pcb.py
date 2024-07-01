@@ -12,6 +12,7 @@ import jax.scipy as jsp
 from jax import lax
 from tqdm import tqdm
 from matplotlib.path import Path
+from flax.training import checkpoints
 
 
 def get_data(split="train"):
@@ -323,6 +324,13 @@ def train_loop(initial_state, train_dataset, epochs=3):
             state, loss = train_step(state, batch)
             epoch_loss += loss
             num_batches += 1
+        checkpoints.save_checkpoint(
+            ckpt_dir="/Users/dougwoodward/dev/jets/pcb_checkpoints/",
+            target=state,
+            step=epoch,
+            prefix="pcb_checkpoint_",
+            overwrite=True
+        )
         avg_loss = epoch_loss / num_batches
         print(f"Epoch {epoch + 1}, Average Loss: {avg_loss}")
     return state
@@ -349,4 +357,4 @@ if __name__ == "__main__":
                                             tx=optimizer)
 
 
-    out_params = train_loop(model_state, train_dataset, epochs=3)
+    out_params = train_loop(model_state, train_dataset, epochs=30)
