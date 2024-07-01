@@ -98,73 +98,53 @@ class InstanceSegmentationHead(nn.Module):
         return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
 
-
-@jax.jit
-def create_segmentation_mask(data, image_shape=(480, 640)):
-    print("-----processing----")
-    print(data)
-    print("--------")
-    def polygon_to_mask(polygon, shape):
-        y, x = jnp.mgrid[:shape[0], :shape[1]]
-        x, y = x.reshape(-1), y.reshape(-1)
-        
-        polygon = jnp.reshape(polygon, (-1, 2))  # Ensure 2D array
-        n = polygon.shape[0]
-        
-        def body_fun(i, inside):
-            j = (i + 1) % n
-            p1x, p1y = polygon[i]
-            p2x, p2y = polygon[j]
-            
-            mask = ((p1y > y) != (p2y > y)) & \
-                   (x < (p2x - p1x) * (y - p1y) / (p2y - p1y + 1e-8) + p1x)
-            return inside ^ mask
-        
-        inside = jax.lax.fori_loop(0, n, body_fun, jnp.zeros(x.shape[0], dtype=bool))
-        return inside.reshape(shape)
-
-    def process_single_instance(idx, mask, category, segmentation):
-        # Handle potential empty segmentation
-        category = category[idx]
-        print("SDFSDF", segmentation)
-        print("IDX", idx)
-        if jnp.ndim(segmentation) > 2:
-            segmentation = segmentation[idx]
-        def create_instance_mask(seg):
-            return jax.lax.cond(
-                seg.size > 0,
-                lambda s: polygon_to_mask(s, image_shape),
-                lambda _: jnp.zeros(image_shape, dtype=bool),
-                seg
-            )
-        
-        instance_mask = create_instance_mask(jnp.array(segmentation))
-        return jnp.where(instance_mask, category, mask)
-
-    initial_mask = jnp.zeros(image_shape, dtype=jnp.int32)
+def preprocess_data(json_data, image_shape=(480, 640)):
+    """
+    Convert JSON object detection data to a pixelwise mask.
     
-    # Handle empty input
-    num_instances = jnp.shape(data['category'])[0]
-    print(num_instances) 
-    if num_instances < 1:
-        print("---0 labels, return zeroes")
-        return initial_mask
-    def body_fun(carry, x):
-        mask, i = carry
-        print("idx", i)
-        return (
-            jax.lax.cond(
-                i < num_instances,
-                lambda args: process_single_instance(i, args[0], args[1], args[2]),
-                lambda args: args[0],
-                (mask, data['category'], data['segmentation'])
-            ),
-            i + 1
-        ), None
+    Args:
+    json_data (dict): Object detection data with 'category' and 'segmentation' keys.
+    image_shape (tuple): Shape of the output image (height, width).
+    
+    Returns:
+    jnp.array: Pixelwise mask where each pixel value represents the object category.
+    """
+    mask = np.zeros(image_shape, dtype=np.int32)
+    print(json_data) 
+    for category, segmentation in zip(json_data['category'], json_data['segmentation']):
+        # Convert segmentation to numpy array
+        polygon = np.array(segmentation[0], dtype=np.int32).reshape((-1, 2))
+        
+        # Create a mask for this polygon
+        rr, cc = polygon_to_mask(polygon, image_shape)
+        
+        # Assign category to the masked area (adding 1 to reserve 0 for background)
+        mask[rr, cc] = category + 1
+    
+    # Convert numpy array to jax array
+    return jnp.array(mask)
 
-    final_mask, _ = jax.lax.scan(body_fun, (initial_mask, 0), None, length=num_instances)
-    return final_mask
+def preprocess_batch(batch):
+    print(batch)
+    print(len(batch))
+    images = [b['image'] for b in batch]
+    json_data = [b['annotations'] for b in batch]
+    masks = np.stack([preprocess_data(data) for data in json_data])
+    return {'images': jnp.array(images), 'masks': jnp.array(masks)}
 
+
+def polygon_to_mask(polygon, shape):
+    """
+    Convert a polygon to a mask using the point-in-polygon algorithm.
+    """
+    mask = np.zeros(shape, dtype=bool)
+    rr, cc = np.meshgrid(range(shape[0]), range(shape[1]), indexing='ij')
+    rr, cc = rr.ravel(), cc.ravel()
+    points = np.vstack((rr, cc)).T
+    path = Path(polygon)
+    mask_flat = path.contains_points(points)
+    mask = mask_flat.reshape(shape)
+    return np.where(mask)
 
 @jax.jit
 def hungarian_algorithm(cost_matrix):
@@ -317,28 +297,12 @@ class InstanceSegmentationModel(nn.Module):
 
 
 
-def convert_to_segmentation_format(instance_dict, mask_shape):
-    classes = jnp.zeros(mask_shape[-1])
-    mask = jnp.zeros((1,480, 640, 3, 4))
-    for idx, seg in enumerate(instance_dict["segmentation"]):
-        category = instance_dict["category"][idx]
-        mask.at[0:100, 0:100, idx].set(1)
-        classes.at[idx].set(category)
-    return {"masks": mask, "classes": classes}
-
-def iou_loss(y_pred, y_true):
-    intersection = jnp.sum(y_pred * y_true, axis=(1, 2))
-    union = jnp.sum(y_pred + y_true, axis=(1, 2))
-    iou = intersection / union
-    return 1 - iou
-
-
 @jax.jit
 def train_step(state, batch):
     def loss_fn(params):
         batch_im = jnp.expand_dims(batch['image'], 0)
         predictions = state.apply_fn(params, batch_im)
-        loss = segmentation_loss(predictions, create_segmentation_mask(batch['objects']))
+        loss = segmentation_loss(predictions, batch['masks'])
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
@@ -355,7 +319,10 @@ def train_loop(initial_state, train_dataset, epochs=3):
     for epoch in range(epochs):
         epoch_loss = 0.0
         num_batches = 0
-        for batch in tqdm(train_dataset):
+        for raw_batch in tqdm(train_dataset):
+            batch = preprocess_batch(raw_batch)
+            json_data = batch['objects']
+            masks = jax.vmap(preprocess_data)(json_data)
             state, loss = train_step(state, batch)
             epoch_loss += loss
             num_batches += 1
