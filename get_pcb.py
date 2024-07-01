@@ -11,6 +11,7 @@ from jax import tree_util
 import jax.scipy as jsp
 from jax import lax
 from tqdm import tqdm
+from matplotlib.path import Path
 
 
 def get_data(split="train"):
@@ -110,7 +111,6 @@ def preprocess_data(json_data, image_shape=(480, 640)):
     jnp.array: Pixelwise mask where each pixel value represents the object category.
     """
     mask = np.zeros(image_shape, dtype=np.int32)
-    print(json_data) 
     for category, segmentation in zip(json_data['category'], json_data['segmentation']):
         # Convert segmentation to numpy array
         polygon = np.array(segmentation[0], dtype=np.int32).reshape((-1, 2))
@@ -125,10 +125,8 @@ def preprocess_data(json_data, image_shape=(480, 640)):
     return jnp.array(mask)
 
 def preprocess_batch(batch):
-    print(batch)
-    print(len(batch))
     images = [b['image'] for b in batch]
-    json_data = [b['annotations'] for b in batch]
+    json_data = [b['objects'] for b in batch]
     masks = np.stack([preprocess_data(data) for data in json_data])
     return {'images': jnp.array(images), 'masks': jnp.array(masks)}
 
@@ -300,7 +298,8 @@ class InstanceSegmentationModel(nn.Module):
 @jax.jit
 def train_step(state, batch):
     def loss_fn(params):
-        batch_im = jnp.expand_dims(batch['image'], 0)
+        print(batch)
+        batch_im = batch['images'] # jnp.expand_dims(batch['image'], 0)
         predictions = state.apply_fn(params, batch_im)
         loss = segmentation_loss(predictions, batch['masks'])
         return loss
@@ -320,9 +319,7 @@ def train_loop(initial_state, train_dataset, epochs=3):
         epoch_loss = 0.0
         num_batches = 0
         for raw_batch in tqdm(train_dataset):
-            batch = preprocess_batch(raw_batch)
-            json_data = batch['objects']
-            masks = jax.vmap(preprocess_data)(json_data)
+            batch = preprocess_batch([raw_batch])
             state, loss = train_step(state, batch)
             epoch_loss += loss
             num_batches += 1
@@ -337,7 +334,6 @@ if __name__ == "__main__":
 
     train_dataset = get_data("train")
     # expand the sample image so it looks like batch of 1
-    print(train_dataset[0]['objects'])
     exp_img = jnp.expand_dims(train_dataset[0]["image"], 0)
     model = InstanceSegmentationModel()
     # init model
