@@ -10,9 +10,12 @@ from flax.training import train_state
 from jax import tree_util
 import jax.scipy as jsp
 from jax import lax
+import orbax
 from tqdm import tqdm
 from matplotlib.path import Path
 from flax.training import checkpoints
+
+CKPT_DIR = '/Users/dougwoodward/dev/jets/pcb_checkpoints_o/'
 
 
 def get_data(split="train"):
@@ -316,6 +319,20 @@ def train_step(state, batch):
 
 def train_loop(initial_state, train_dataset, epochs=3):
     state = initial_state
+    mgr_options = orbax.checkpoint.CheckpointManagerOptions(
+            create=True,
+            max_to_keep=3,
+            keep_period=2,
+            # step_prefix='pcb_checkpoint'
+    )
+    ckpt_mgr = orbax.checkpoint.CheckpointManager(
+      CKPT_DIR,
+      orbax.checkpoint.Checkpointer(
+          orbax.checkpoint.PyTreeCheckpointHandler()
+      ),
+      mgr_options
+    )
+
     for epoch in range(epochs):
         epoch_loss = 0.0
         num_batches = 0
@@ -324,13 +341,9 @@ def train_loop(initial_state, train_dataset, epochs=3):
             state, loss = train_step(state, batch)
             epoch_loss += loss
             num_batches += 1
-        checkpoints.save_checkpoint(
-            ckpt_dir="/Users/dougwoodward/dev/jets/pcb_checkpoints/",
-            target=state,
-            step=epoch,
-            prefix="pcb_checkpoint_",
-            overwrite=True
-        )
+        save_args = flax.training.orbax_utils.save_args_from_target(state)
+        ckpt_mgr.save(epoch, state, save_kwargs={'save_args': save_args})
+
         avg_loss = epoch_loss / num_batches
         print(f"Epoch {epoch + 1}, Average Loss: {avg_loss}")
     return state
@@ -351,10 +364,8 @@ if __name__ == "__main__":
     # Initialize the model
     params = model.init(init_rng, exp_img)
     optimizer = optax.adam(learning_rate=1e-4)
-    #  
     model_state = train_state.TrainState.create(apply_fn=model.apply,
                                             params=params,
                                             tx=optimizer)
-
 
     out_params = train_loop(model_state, train_dataset, epochs=30)
