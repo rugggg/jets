@@ -11,12 +11,26 @@ from jax import tree_util
 import jax.scipy as jsp
 from jax import lax
 import orbax
+import wandb
 from tqdm import tqdm
 from matplotlib.path import Path
 from flax.training import checkpoints
 
 CKPT_DIR = '/Users/dougwoodward/dev/jets/pcb_checkpoints_o/'
 
+# start a new wandb run to track this script
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="pcb",
+
+    # track hyperparameters and run metadata
+    config={
+    "learning_rate": 0.02,
+    "architecture": "custom u-net",
+    "dataset": "pcb-defect-segmentation",
+    "epochs": 10,
+    }
+)
 
 def get_data(split="train"):
     ds = load_dataset("keremberke/pcb-defect-segmentation", name="full")
@@ -345,6 +359,7 @@ def train_loop(initial_state, train_dataset, epochs=3):
         ckpt_mgr.save(epoch, state, save_kwargs={'save_args': save_args})
 
         avg_loss = epoch_loss / num_batches
+        wandb.log({"loss": avg_loss})
         print(f"Epoch {epoch + 1}, Average Loss: {avg_loss}")
     return state
 
@@ -369,3 +384,4 @@ if __name__ == "__main__":
                                             tx=optimizer)
 
     out_params = train_loop(model_state, train_dataset, epochs=30)
+    wandb.finish()
