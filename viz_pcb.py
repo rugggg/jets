@@ -9,9 +9,10 @@ from datasets import load_dataset
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+from PIL import Image
 
 # Import your model definition
-from get_pcb import InstanceSegmentationModel, preprocess_batch
+from get_pcb import InstanceSegmentationModel, preprocess_batch, preprocess_data
 
 CKPT_DIR = '/Users/dougwoodward/dev/jets/pcb_checkpoints_o/'
 
@@ -74,60 +75,95 @@ def run_inference(model, state, image):
     output = model.apply(state.params, image)
     return output
 
-def visualize_segmentation(image, mask, output_file):
+def visualize_masks(image, pred_mask, truth_mask, output_file):
+    # Convert PIL image to numpy array if necessary
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+    
     # Convert JAX arrays to numpy if necessary
     if isinstance(image, jnp.ndarray):
         image = np.array(image)
-    if isinstance(mask, jnp.ndarray):
-        mask = np.array(mask)
+    if isinstance(pred_mask, jnp.ndarray):
+        pred_mask = np.array(pred_mask)
+    if isinstance(truth_mask, jnp.ndarray):
+        truth_mask = np.array(truth_mask)
     
     # Ensure image is in the correct range [0, 1]
     image = image.astype(np.float32) / 255.0 if image.max() > 1.0 else image
     
-    # Create a color mask
-    color_mask = np.zeros((*mask.shape[:2], 3), dtype=np.float32)
-    color_mask[mask == 1] = [1, 0, 0]  # Red for class 1
-    color_mask[mask == 2] = [0, 1, 0]  # Green for class 2
-    # Add more colors for additional classes if needed
+    # Create color masks
+    unique_classes = np.unique(np.concatenate((pred_mask, truth_mask)))
+    cmap = plt.colormaps['tab10']
+    colors = cmap(np.linspace(0, 1, len(unique_classes))) 
+
+    def create_color_mask(mask):
+        color_mask = np.zeros((*mask.shape[:2], 3), dtype=np.float32)
+        for i, class_id in enumerate(unique_classes):
+            if class_id == 0:  # Assuming 0 is background
+                continue
+            color_mask[mask == class_id] = colors[i, :3]
+        return color_mask
     
-    # Create the overlay
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    plt.imshow(color_mask, alpha=0.5)
-    plt.axis('off')
-    plt.title("Segmentation Overlay")
+    pred_color_mask = create_color_mask(pred_mask)
+    truth_color_mask = create_color_mask(truth_mask)
+    
+    # Create the visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    
+    # Predicted mask overlay
+    ax1.imshow(image)
+    ax1.imshow(pred_color_mask, alpha=0.5)
+    ax1.axis('off')
+    ax1.set_title("Predicted Segmentation")
+    
+    # Ground truth mask overlay
+    ax2.imshow(image)
+    ax2.imshow(truth_color_mask, alpha=0.5)
+    ax2.axis('off')
+    ax2.set_title("Ground Truth Segmentation")
+    
+    # Add colorbar
+    unique_classes = sorted(unique_classes)
+    cbar = fig.colorbar(plt.cm.ScalarMappable(cmap='tab10'), ax=[ax1, ax2], orientation='vertical', fraction=0.046, pad=0.04)
+    cbar.set_ticks(np.linspace(0, 1, len(unique_classes)))
+    cbar.set_ticklabels(unique_classes)
+    cbar.set_label('Class ID')
     
     # Save the figure
-    plt.savefig(output_file, bbox_inches='tight', pad_inches=0)
+    plt.savefig(output_file, bbox_inches='tight', pad_inches=0.1)
     plt.close()
     
-    print(f"Visualization saved to {output_file}")
+    print(f"Comparison visualization saved to {output_file}")
 
 def main():
     # Load the checkpoint
     model, state = load_checkpoint(CKPT_DIR)
 
     # Load a test image
-    test_dataset = load_dataset("keremberke/pcb-defect-segmentation", name="full", split="test")
-    test_image = test_dataset[0]['image']
+    test_dataset = load_dataset("keremberke/pcb-defect-segmentation", name="full", split="train")
+    test_sample = test_dataset[100]
     
-    # Preprocess the test image
-    preprocessed_batch = preprocess_batch([{'image': test_image, 'objects': test_dataset[0]['objects']}])
-    test_image = preprocessed_batch['images']
+    # Get the original image
+    test_image = test_sample['image']
+    # Generate the ground truth mask
+    ground_truth_mask = preprocess_data(test_sample['objects'])
+    print(ground_truth_mask.max())
+    print(ground_truth_mask[0])
+    
+    # Preprocess the test image for the model
+    preprocessed_batch = preprocess_batch([{'image': test_image, 'objects': test_sample['objects']}])
+    model_input_image = preprocessed_batch['images']
 
     # Run inference
-    output = run_inference(model, state, test_image)
+    output = run_inference(model, state, model_input_image)
+    
+    # Convert model output to predicted mask
+    # Adjust this based on your model's output format
+    predicted_mask = jnp.argmax(output, axis=-1)[0]  # Assuming output is [batch, height, width, num_classes]
 
-    # Process and display the output
-    print("Output shape:", output.shape)
-    print("Output:", output)
-
-    # Assuming the output is a segmentation mask, we need to convert it to class labels
-    # This step might need adjustment based on your model's exact output format
-    segmentation_mask = jnp.argmax(output, axis=-1)
-
-    # Visualize and save the segmentation
-    visualize_segmentation(test_image[0], segmentation_mask[0], "segmentation_overlay.png")
+    # Visualize and save the comparison
+    visualize_masks(test_image, predicted_mask, ground_truth_mask, "segmentation_comparison.png")
 
 if __name__ == "__main__":
     main()
+

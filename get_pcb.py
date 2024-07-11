@@ -102,6 +102,17 @@ class InstanceSegmentationHead(nn.Module):
         return {"masks": instance_masks, "class_logits": class_logits, "confidences": confidences}
 
 
+def rotate_point(point, angle, center):
+    """Rotate a point around a given center."""
+    angle_rad = np.radians(angle)
+    cos_theta, sin_theta = np.cos(angle_rad), np.sin(angle_rad)
+    
+    x, y = point[0] - center[0], point[1] - center[1]
+    new_x = x * cos_theta - y * sin_theta + center[0]
+    new_y = x * sin_theta + y * cos_theta + center[1]
+    
+    return np.array([new_x, new_y])
+
 def preprocess_data(json_data, image_shape=(480, 640)):
     """
     Convert JSON object detection data to a pixelwise mask.
@@ -114,10 +125,23 @@ def preprocess_data(json_data, image_shape=(480, 640)):
     jnp.array: Pixelwise mask where each pixel value represents the object category.
     """
     mask = np.zeros(image_shape, dtype=np.int32)
+    height, width = image_shape
+    center = (width / 2, height / 2)  # Center of rotation
+
     for category, segmentation in zip(json_data['category'], json_data['segmentation']):
         # Convert segmentation to numpy array
         polygon = np.array(segmentation[0], dtype=np.int32).reshape((-1, 2))
         
+        # Apply transformations to correct misalignment
+        #polygon[:, 1] = image_shape[0] - polygon[:, 1]  # Vertical flip
+        # Rotate polygon by 45 degrees
+        # polygon = np.array([rotate_point(point, 90, center) for point in polygon])
+
+        # You may need to adjust these scaling factors
+        #polygon[:, 0] *= width / 100  # Scale X coordinates
+        #polygon[:, 1] *= height / 100  # Scale Y coordinates
+        
+        polygon = polygon.astype(np.int32)
         # Create a mask for this polygon
         rr, cc = polygon_to_mask(polygon, image_shape)
         
@@ -141,7 +165,7 @@ def polygon_to_mask(polygon, shape):
     mask = np.zeros(shape, dtype=bool)
     rr, cc = np.meshgrid(range(shape[0]), range(shape[1]), indexing='ij')
     rr, cc = rr.ravel(), cc.ravel()
-    points = np.vstack((rr, cc)).T
+    points = np.vstack((cc, rr)).T
     path = Path(polygon)
     mask_flat = path.contains_points(points)
     mask = mask_flat.reshape(shape)
@@ -353,6 +377,9 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(42)
 
+    num_epochs = 30
+    lr = 1e-2
+
     train_dataset = get_data("train")
     # expand the sample image so it looks like batch of 1
     exp_img = jnp.expand_dims(train_dataset[0]["image"], 0)
@@ -363,22 +390,20 @@ if __name__ == "__main__":
     print(model.tabulate(jax.random.key(0), exp_img))
     # Initialize the model
     params = model.init(init_rng, exp_img)
-    optimizer = optax.adam(learning_rate=1e-4)
+    optimizer = optax.adam(learning_rate=lr)
     model_state = train_state.TrainState.create(apply_fn=model.apply,
                                             params=params,
                                             tx=optimizer)
-
     # start a new wandb run to track this script
     wandb.init(
         # set the wandb project where this run will be logged
         project="pcb",
-
         # track hyperparameters and run metadata
         config={
-        "learning_rate": 0.02,
         "architecture": "custom u-net",
         "dataset": "pcb-defect-segmentation",
-        "epochs": 10,
+        "learning_rate": lr,
+        "epochs": num_epochs,
         }
     )
 
