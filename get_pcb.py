@@ -17,21 +17,6 @@ from matplotlib.path import Path
 from flax.training import checkpoints
 
 CKPT_DIR = '/Users/dougwoodward/dev/jets/pcb_checkpoints_o/'
-
-# start a new wandb run to track this script
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="pcb",
-
-    # track hyperparameters and run metadata
-    config={
-    "learning_rate": 0.02,
-    "architecture": "custom u-net",
-    "dataset": "pcb-defect-segmentation",
-    "epochs": 10,
-    }
-)
-
 def get_data(split="train"):
     ds = load_dataset("keremberke/pcb-defect-segmentation", name="full")
 
@@ -382,6 +367,21 @@ if __name__ == "__main__":
     model_state = train_state.TrainState.create(apply_fn=model.apply,
                                             params=params,
                                             tx=optimizer)
+
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="pcb",
+
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": 0.02,
+        "architecture": "custom u-net",
+        "dataset": "pcb-defect-segmentation",
+        "epochs": 10,
+        }
+    )
+
 
     out_params = train_loop(model_state, train_dataset, epochs=30)
     wandb.finish()
