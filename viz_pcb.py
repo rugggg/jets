@@ -141,14 +141,13 @@ def main():
 
     # Load a test image
     test_dataset = load_dataset("keremberke/pcb-defect-segmentation", name="full", split="train")
-    test_sample = test_dataset[100]
+    test_sample = test_dataset[101]
     
     # Get the original image
     test_image = test_sample['image']
     # Generate the ground truth mask
     ground_truth_mask = preprocess_data(test_sample['objects'])
     print(ground_truth_mask.max())
-    print(ground_truth_mask[0])
     
     # Preprocess the test image for the model
     preprocessed_batch = preprocess_batch([{'image': test_image, 'objects': test_sample['objects']}])
